@@ -100,19 +100,3 @@ class SessionManager:
             if updated >= best_updated:
                 best_updated, best_id = updated, data.get("id", path.stem)
         return best_id
-
-    def list(self) -> List[Dict]:
-        """Metadata for all sessions in this directory, newest first."""
-        d = self._dir()
-        if not d.is_dir():
-            return []
-        out = []
-        for path in d.glob("*.json"):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            out.append({k: data.get(k) for k in ("id", "model", "created", "updated")}
-                       | {"messages": len(data.get("history", []))})
-        return sorted(out, key=lambda s: s.get("updated") or "", reverse=True)
