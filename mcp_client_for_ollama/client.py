@@ -48,6 +48,7 @@ from .utils.tool_display import ToolDisplayManager
 from .utils.hil_manager import HumanInTheLoopManager, AbortQueryException
 from .utils.fzf_style_completion import FZFStyleCompleter
 from .utils.input import get_input_no_autocomplete
+from .utils.session import SessionManager
 
 
 class MCPClient:
@@ -97,6 +98,7 @@ class MCPClient:
         self.sessions = {}  # Dict to store multiple sessions
         # UI components
         self.chat_history = []  # Add chat history list to store interactions
+        self.session = None  # SessionManager, wired up in async_main for --resume support
         self.chat_input_history = InMemoryHistory()  # Preserve prompt recall across mode switches
         # Command completer for interactive prompts
         self.prompt_session = self._create_chat_prompt_session()
@@ -808,8 +810,20 @@ class MCPClient:
         # Append query and response to chat history
         if not self.abort_current_query:
             self.chat_history.append({"query": query, "response": response_text})
+            self._save_session()
 
         return response_text
+
+    def _save_session(self):
+        """Persist the active session to disk (no-op if sessions are disabled)."""
+        if self.session:
+            ok = self.session.save(
+                self.chat_history,
+                self.model_manager.get_current_model(),
+                self.host,
+            )
+            if not ok:
+                self.console.print("[dim]Warning: failed to save session.[/dim]")
 
     async def get_user_input(self, prompt_text: str = None) -> str:
         """Get user input with full keyboard navigation support"""
@@ -962,6 +976,8 @@ class MCPClient:
             await self.model_manager.fetch_capabilities(self.model_manager.get_current_model())
             self.display_current_model()
         self.print_startup_help()
+        if self.session and self.session.id:
+            self.console.print(f"[dim]Session {self.session.id} — resume later with: ollmcp -r {self.session.id}[/dim]")
         self.print_auto_load_default_config_status()
         self.model_manager.print_resolution_status(self.model_resolution_status)
         await self.display_check_for_updates()
@@ -1379,6 +1395,7 @@ class MCPClient:
         self.chat_history = []
         self.actual_token_count = 0
         self.pending_resources = []
+        self._save_session()
         self.console.print(f"[green]Context cleared! Removed {original_history_length} conversation entries.[/green]")
 
     def display_context_stats(self):
@@ -1802,6 +1819,10 @@ class MCPClient:
                 title="Reload Failed", border_style="red", expand=False
             ))
 
+# Sentinel value for a bare --resume (no id) meaning "most recent session in cwd".
+# cli.run_cli() rewrites a value-less --resume into `--resume __LAST__` before parsing.
+RESUME_LAST = "__LAST__"
+
 app = typer.Typer(help="MCP Client for Ollama", context_settings={"help_option_names": ["-h", "--help"]})
 app.add_typer(mcp_app, name="mcp")
 
@@ -1843,6 +1864,14 @@ def main(
         rich_help_panel="Ollama Configuration"
     ),
 
+    # Session
+    resume: Optional[str] = typer.Option(
+        None, "--resume", "-r",
+        metavar="[SESSION_ID]",
+        help="Resume a saved session by id, or omit the id to resume the most recent session in this directory.",
+        rich_help_panel="Session",
+    ),
+
     # General Options
     version: Optional[bool] = typer.Option(
         None, "--version", "-v",
@@ -1863,7 +1892,7 @@ def main(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host))
+        loop.run_until_complete(async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, resume))
     finally:
         try:
             # Ensure executor cleanup completes before closing loop
@@ -1872,7 +1901,7 @@ def main(
         finally:
             loop.close()
 
-async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host):
+async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, model, host, resume=None):
     """Asynchronous main function to run the MCP Client for Ollama"""
 
     console = Console()
@@ -1925,12 +1954,41 @@ async def async_main(mcp_server, mcp_server_url, servers_json, claude_desktop, m
             client.ollama = ollama.AsyncClient(host=host)
             client.model_manager.ollama = client.ollama
 
-        # Resolve the model to use: --model flag > saved config > first available
-        # model, validated against what's actually installed (auto_load_default_config()
-        # above already applied any saved model to model_manager when a config existed).
-        # `model` is None unless --model was actually passed, so this is unambiguous
-        # (unlike comparing against the DEFAULT_MODEL sentinel).
-        saved_model = client.model_manager.get_current_model() if client.default_configuration_status else None
+        # Session: resume an existing one (--resume) or start a fresh one.
+        client.session = SessionManager()
+        resumed = None
+        if resume:
+            target_id = client.session.resolve_last() if resume == RESUME_LAST else resume
+            resumed = client.session.load(target_id) if target_id else None
+            if resumed:
+                client.chat_history = resumed["history"]
+                client.session.id = resumed["id"]
+                client.session._created = resumed.get("created")
+                # Restore the session's host unless --host was explicitly given.
+                if host is None and resumed.get("host"):
+                    client.host = resumed["host"]
+                    client.ollama = ollama.AsyncClient(host=resumed["host"])
+                    client.model_manager.ollama = client.ollama
+                console.print(f"[green]Resumed session {resumed['id']} ({len(resumed['history'])} messages)[/green]")
+            elif resume == RESUME_LAST:
+                console.print("[yellow]No previous session found in this directory. Starting a new session.[/yellow]")
+            else:
+                console.print(f"[yellow]No session found with id '{resume}'. Starting a new session.[/yellow]")
+        if client.session.id is None:
+            client.session.new()
+
+        # Resolve the model to use: --model flag > resumed session > saved config >
+        # first available model, validated against what's actually installed
+        # (auto_load_default_config() above already applied any saved model to
+        # model_manager when a config existed). `model` is None unless --model was
+        # actually passed, so this is unambiguous (unlike comparing against the
+        # DEFAULT_MODEL sentinel).
+        if resumed and resumed.get("model"):
+            saved_model = resumed["model"]
+        elif client.default_configuration_status:
+            saved_model = client.model_manager.get_current_model()
+        else:
+            saved_model = None
         client.model_resolution_status = await client.model_manager.resolve_initial_model(model, saved_model)
 
         await client.chat_loop()
